@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using ExileCore2.Shared;
 
@@ -20,7 +21,7 @@ namespace EssenceHelper
         private List<PoE2ScoutItem> _cachedEssence = new();
         private readonly TimeSpan _cacheExpiry = TimeSpan.FromMinutes(5);
         private DateTime _lastRequestTime = DateTime.MinValue;
-        private readonly TimeSpan _requestDelay = TimeSpan.FromMilliseconds(500);
+        private readonly TimeSpan _requestDelay = TimeSpan.FromMilliseconds(750);
 
         public PoE2ScoutApiService(string leagueName = "Rise of the Abyssal", 
             Action<string>? logInfo = null, Action<string>? logError = null)
@@ -31,7 +32,7 @@ namespace EssenceHelper
             
             _httpClient = new HttpClient
             {
-                Timeout = TimeSpan.FromSeconds(30)
+                Timeout = TimeSpan.FromSeconds(5)
             };
             
             SetupUserAgent();
@@ -92,7 +93,9 @@ namespace EssenceHelper
                 {
                     await ApplyRateLimit();
                     
-                    var jsonResponse = await _httpClient.GetStringAsync(url);
+                    // create a 5-second timeout cancellation token for each API call
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    var jsonResponse = await _httpClient.GetStringAsync(url, cts.Token);
                     if (string.IsNullOrEmpty(jsonResponse))
                     {
                         _logError($"Page {page} returned empty response");
@@ -112,6 +115,22 @@ namespace EssenceHelper
                         if (page == 1) _logInfo($"Page {page} returned no items");
                         break;
                     }
+                }
+                catch (OperationCanceledException ex) when (ex.CancellationToken.IsCancellationRequested)
+                {
+                    _logError($"API call for page {page} timed out after 5 seconds");
+                    break;
+                }
+                catch (TaskCanceledException ex) when (ex.CancellationToken.IsCancellationRequested)
+                {
+                    _logError($"API call for page {page} timed out after 5 seconds");
+                    break;
+                }
+                catch (HttpRequestException ex)
+                {
+                    _logError($"HTTP error for page {page} in {category}: {ex.Message}");
+                    LogInnerException(ex);
+                    break;
                 }
                 catch (Exception ex)
                 {

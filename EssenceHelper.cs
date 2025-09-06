@@ -16,7 +16,6 @@ using ExileCore2.PoEMemory.Elements.InventoryElements;
 using ExileCore2.PoEMemory.MemoryObjects;
 using ExileCore2.Shared.Enums;
 using ImGuiNET;
-using EssenceHelper.Utils;
 
 namespace EssenceHelper
 {
