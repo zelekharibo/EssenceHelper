@@ -15,6 +15,9 @@ namespace EssenceHelper
         [Menu("Auto-Update Interval (minutes)", "How often to fetch new data from API")]
         public RangeNode<int> ApiUpdateInterval { get; set; } = new(30, 5, 180);
 
+        [Menu("Use NinjaPricer Data", "Use local NinjaPricer data instead of API calls")]
+        public ToggleNode UseNinjaPricerData { get; set; } = new(false);
+
         public string LastApiUpdateTime { get; set; } = string.Empty;
     }
 }

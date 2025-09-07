@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Numerics;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -49,7 +50,7 @@ namespace EssenceHelper
                 LogMessage("API service initialized successfully");
                 
                 // trigger immediate price update on plugin start
-                _ = Task.Run(UpdateEssencePricesFromApi);
+                _ = Task.Run(UpdateEssencePrices);
                 
                 return true;
             }
@@ -67,7 +68,7 @@ namespace EssenceHelper
             
             if (ImGui.Button("Update Essence Prices Now"))
             {
-                _ = Task.Run(UpdateEssencePricesFromApi);
+                _ = Task.Run(UpdateEssencePrices);
             }
             
             ImGui.SameLine();
@@ -75,6 +76,10 @@ namespace EssenceHelper
                 ? "Never updated" 
                 : $"Last updated: {_lastEssenceCacheUpdate:HH:mm:ss}";
             ImGui.Text(lastUpdateText);
+            
+            // show current data source
+            var dataSource = Settings.UseNinjaPricerData.Value ? "NinjaPricer (Local)" : "PoE2Scout API";
+            ImGui.Text($"Data source: {dataSource}");
             
             if (_essencePriceCache.Count > 0)
             {
@@ -145,10 +150,10 @@ namespace EssenceHelper
         {
             if (!Settings.Enable) return;
 
-            // update essence prices from API if needed
+            // update essence prices if needed
             if (ShouldUpdateEssencePrices())
             {
-                _ = Task.Run(UpdateEssencePricesFromApi);
+                _ = Task.Run(UpdateEssencePrices);
             }
 
             // detect and display essence prices
@@ -210,6 +215,18 @@ namespace EssenceHelper
             return DateTime.Now - _lastEssenceCacheUpdate >= updateInterval;
         }
 
+        private async Task UpdateEssencePrices()
+        {
+            if (Settings.UseNinjaPricerData.Value)
+            {
+                await UpdateEssencePricesFromNinjaPricer();
+            }
+            else
+            {
+                await UpdateEssencePricesFromApi();
+            }
+        }
+
         private async Task UpdateEssencePricesFromApi()
         {
             if (_isUpdatingEssencePrices) return; // prevent concurrent updates
@@ -242,11 +259,11 @@ namespace EssenceHelper
                 _lastEssenceCacheUpdate = DateTime.Now;
                 _lastApiUpdate = DateTime.Now; // sync both timestamps
                 SaveLastApiUpdateTime(); // save to persistent settings
-                LogMessage($"Updated essence prices: {_essencePriceCache.Count} essences cached");
+                LogMessage($"Updated essence prices from API: {_essencePriceCache.Count} essences cached");
             }
             catch (Exception ex)
             {
-                LogError($"Failed to update essence prices: {ex.Message}");
+                LogError($"Failed to update essence prices from API: {ex.Message}");
             }
             finally
             {
@@ -571,9 +588,71 @@ namespace EssenceHelper
             return 0;
         }
 
+        private async Task UpdateEssencePricesFromNinjaPricer()
+        {
+            if (_isUpdatingEssencePrices) return; // prevent concurrent updates
+            
+            try
+            {
+                _isUpdatingEssencePrices = true;
+                
+                var ninjaPricerDataPath = GetNinjaPricerDataPath("Essences");
+                if (!File.Exists(ninjaPricerDataPath))
+                {
+                    LogError($"NinjaPricer data file not found: {ninjaPricerDataPath}");
+                    return;
+                }
+
+                var jsonContent = await File.ReadAllTextAsync(ninjaPricerDataPath);
+                var ninjaPricerEssences = JsonSerializer.Deserialize<List<NinjaPricerEssenceItem>>(jsonContent, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                });
+
+                if (ninjaPricerEssences == null)
+                {
+                    LogError("Failed to deserialize NinjaPricer essence data");
+                    return;
+                }
+
+                // clear existing cache and populate with new data
+                _essencePriceCache.Clear();
+                foreach (var essence in ninjaPricerEssences)
+                {
+                    if (!string.IsNullOrEmpty(essence.Text))
+                    {
+                        var price = essence.GetCurrentPrice();
+                        if (price > 0)
+                        {
+                            _essencePriceCache.TryAdd(essence.Text, price);
+                        }
+                    }
+                }
+
+                _lastEssenceCacheUpdate = DateTime.Now;
+                LogMessage($"Updated essence prices from NinjaPricer: {_essencePriceCache.Count} essences cached");
+            }
+            catch (Exception ex)
+            {
+                LogError($"Failed to update essence prices from NinjaPricer: {ex.Message}");
+            }
+            finally
+            {
+                _isUpdatingEssencePrices = false;
+            }
+        }
+
+        private string GetNinjaPricerDataPath(string categoryName)
+        {
+            // build path: Plugins/Temp/NinjaPricer/poescoutdata/LEAGUE_NAME/CATEGORY_NAME.json
+            var pluginsPath = Path.GetDirectoryName(Path.GetDirectoryName(DirectoryFullName)); // go up from Source/EssenceHelper to Plugins
+            var ninjaPricerTempPath = Path.Combine(pluginsPath, "Temp", "NinjaPricer", "poescoutdata", Settings.LeagueName.Value, $"{categoryName}.json");
+            return ninjaPricerTempPath;
+        }
+
         private async Task UpdateDeferListFromApi()
         {
-            await UpdateEssencePricesFromApi();
+            await UpdateEssencePrices();
         }
     }
 }
