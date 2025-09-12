@@ -5,7 +5,6 @@ using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using ExileCore2;
@@ -17,6 +16,7 @@ using ExileCore2.PoEMemory.Elements.InventoryElements;
 using ExileCore2.PoEMemory.MemoryObjects;
 using ExileCore2.Shared.Enums;
 using ImGuiNET;
+using EssenceHelper.Utils;
 
 namespace EssenceHelper
 {
@@ -28,11 +28,12 @@ namespace EssenceHelper
         private readonly ConcurrentDictionary<string, decimal> _essencePriceCache = new();
         private DateTime _lastEssenceCacheUpdate = DateTime.MinValue;
         private bool _isUpdatingEssencePrices = false;
-        private readonly List<(string, Vector2)> _reusableEssencesList = new();
-        private readonly HashSet<string> _reusableEssenceNames = new();
-        private readonly List<(string name, decimal price)> _reusableEssencesWithPrices = new();
-        
+        private DateTime _lastAutoCorruptTime = DateTime.MinValue;
         private readonly StringComparison _essenceComparison = StringComparison.OrdinalIgnoreCase;
+
+        private readonly List<(Entity entity, LabelOnGround label, string EssenceName, Vector2 Position)> _reusableEssencesList = new();
+        private readonly HashSet<string> _reusableEssenceNames = new();
+        private readonly List<(Entity entity, LabelOnGround label, string EssenceName, Vector2 Position, decimal price)> _reusableEssencesWithPrices = new();
         
         public override bool Initialise()
         {
@@ -41,14 +42,14 @@ namespace EssenceHelper
                 // reset last update time to force fresh price fetch on every plugin start
                 _lastEssenceCacheUpdate = DateTime.MinValue;
                 
-                // API integration is always enabled
+                // initialize API service
                 _apiService = new PoE2ScoutApiService(
                     Settings.LeagueName.Value,
                     LogMessage,
                     LogError
                 );
                 LogMessage("API service initialized successfully");
-                
+
                 // trigger immediate price update on plugin start
                 _ = Task.Run(UpdateEssencePrices);
                 
@@ -60,7 +61,6 @@ namespace EssenceHelper
                 return false;
             }
         }
-
 
         public override void DrawSettings()
         {
@@ -98,7 +98,6 @@ namespace EssenceHelper
                 
                 if (essencesCopy.Count == 0)
                 {
-                    ImGui.Text("No essence prices loaded");
                     return;
                 }
                 
@@ -145,7 +144,6 @@ namespace EssenceHelper
             }
         }
 
-
         public override void Render()
         {
             if (!Settings.Enable) return;
@@ -162,14 +160,17 @@ namespace EssenceHelper
             {
                 DisplayEssencePrices(essencesOnGround);
             }
+
+            if (ShouldAutoCorruptEssence())
+            {
+                AutoCorruptEssence();
+            }
         }
 
         private bool ShouldUpdateFromApi()
         {
-            
-            // try to get last update time from persistent settings
+            // get last update time from persistent settings
             var lastUpdate = GetLastApiUpdateFromSettings();
-            
             var updateInterval = TimeSpan.FromMinutes(Settings.ApiUpdateInterval.Value);
             return DateTime.Now - lastUpdate >= updateInterval;
         }
@@ -177,10 +178,7 @@ namespace EssenceHelper
         private DateTime GetLastApiUpdateFromSettings()
         {
             if (string.IsNullOrEmpty(Settings.LastApiUpdateTime))
-            {
-                // first time ever, force immediate update
-                return DateTime.MinValue;
-            }
+                return DateTime.MinValue; // first time ever, force immediate update
             
             if (DateTime.TryParse(Settings.LastApiUpdateTime, out var lastUpdate))
             {
@@ -271,12 +269,12 @@ namespace EssenceHelper
             }
         }
 
-        private List<(string EssenceName, Vector2 Position)> GetEssencesOnGround()
+        private List<(Entity entity, LabelOnGround label, string EssenceName, Vector2 Position)> GetEssencesOnGround()
         {
             return DetectEssencesOnGround();
         }
 
-        private List<(string EssenceName, Vector2 Position)> DetectEssencesOnGround()
+        private List<(Entity entity, LabelOnGround label, string EssenceName, Vector2 Position)> DetectEssencesOnGround()
         {
             // reuse collections for better performance
             _reusableEssencesList.Clear();
@@ -311,7 +309,7 @@ namespace EssenceHelper
                             labelText.Contains("Essence", _essenceComparison) &&
                             _reusableEssenceNames.Add(labelText))
                         {
-                            _reusableEssencesList.Add((labelText, position));
+                            _reusableEssencesList.Add((itemOnGround, label, labelText, position));
                         }
                         
                         // check label's children for essence text - find ALL essences in this monolith
@@ -327,7 +325,7 @@ namespace EssenceHelper
                                         childText.Contains("Essence", _essenceComparison) &&
                                         _reusableEssenceNames.Add(childText))
                                     {
-                                        _reusableEssencesList.Add((childText, position));
+                                        _reusableEssencesList.Add((itemOnGround, label, childText, position));
                                     }
                                     
                                     // check grandchildren too
@@ -343,7 +341,7 @@ namespace EssenceHelper
                                                     grandChildText.Contains("Essence", _essenceComparison) &&
                                                     _reusableEssenceNames.Add(grandChildText))
                                                 {
-                                                    _reusableEssencesList.Add((grandChildText, position));
+                                                    _reusableEssencesList.Add((itemOnGround, label, grandChildText, position));
                                                 }
                                             }
                                             catch
@@ -374,48 +372,34 @@ namespace EssenceHelper
             return _reusableEssencesList;
         }
 
-        private void DisplayEssencePrices(List<(string EssenceName, Vector2 Position)> essences)
+        private void DisplayEssencePrices(List<(Entity entity, LabelOnGround label, string EssenceName, Vector2 Position)> essences)
         {
-            if (essences.Count == 0) return;
+            if (essences.Count == 0) 
+                return;
 
             try
             {
                 var itemLabels = GameController.IngameState.IngameUi.ItemsOnGroundLabelElement;
                 var labelsVisible = itemLabels?.LabelsOnGroundVisible;
-                if (labelsVisible?.Any() != true) return;
+                
+                if (labelsVisible?.Any() != true) 
+                    return;
 
-                // reuse collection for better performance
-                _reusableEssencesWithPrices.Clear();
-                decimal totalPrice = 0;
-
-                // calculate total price and prepare essence data
-                for (int i = 0; i < essences.Count; i++)
-                {
-                    var (essenceName, _) = essences[i];
-                    var price = GetEssencePrice(essenceName);
-                    if (price > 0)
-                    {
-                        totalPrice += price;
-                        _reusableEssencesWithPrices.Add((essenceName, price));
-                    }
-                }
-
-
-                if (totalPrice <= 0) return;
+                var totalPrice = CalculateTotalPrice(essences);
+                if (totalPrice <= 0) 
+                    return;
 
                 // find and draw on the relevant monolith
                 foreach (var label in labelsVisible)
                 {
                     try
                     {
-                        var itemOnGround = label?.ItemOnGround;
-                        var metadata = itemOnGround?.Metadata;
-                        if (metadata?.Contains("Monolith") != true) continue;
-
-                        if (!IsMonolithWithEssences(label, essences)) continue;
+                        if (!IsValidMonolithForEssences(label, essences))
+                            continue;
 
                         var labelElement = label?.Label;
-                        if (labelElement == null) continue;
+                        if (labelElement == null) 
+                            continue;
 
                         DrawTotalPrice(labelElement, totalPrice);
                         DrawIndividualPrices(labelElement, _reusableEssencesWithPrices);
@@ -432,8 +416,37 @@ namespace EssenceHelper
                 LogError($"Error displaying essence prices: {ex.Message}");
             }
         }
+        
+        private decimal CalculateTotalPrice(List<(Entity entity, LabelOnGround label, string EssenceName, Vector2 Position)> essences)
+        {
+            // reuse collection for better performance
+            _reusableEssencesWithPrices.Clear();
+            decimal totalPrice = 0;
 
-        private bool IsMonolithWithEssences(dynamic label, List<(string EssenceName, Vector2 Position)> essences)
+            // calculate total price and prepare essence data
+            for (int i = 0; i < essences.Count; i++)
+            {
+                var (_, _, essenceName, _) = essences[i];
+                var price = GetEssencePrice(essenceName);
+                if (price > 0)
+                {
+                    totalPrice += price;
+                    _reusableEssencesWithPrices.Add((essences[i].entity, essences[i].label, essenceName, essences[i].Position, price));
+                }
+            }
+            
+            return totalPrice;
+        }
+        
+        private bool IsValidMonolithForEssences(dynamic label, List<(Entity entity, LabelOnGround label, string EssenceName, Vector2 Position)> essences)
+        {
+            var itemOnGround = label?.ItemOnGround;
+            var metadata = itemOnGround?.Metadata;
+            
+            return metadata?.Contains("Monolith") == true && IsMonolithWithEssences(label, essences);
+        }
+
+        private bool IsMonolithWithEssences(dynamic label, List<(Entity entity, LabelOnGround label, string EssenceName, Vector2 Position)> essences)
         {
             var itemOnGround = label?.ItemOnGround;
             if (itemOnGround?.Metadata?.Contains("Monolith") != true) return false;
@@ -458,7 +471,7 @@ namespace EssenceHelper
             return false;
         }
 
-        private bool HasMatchingEssence(dynamic element, List<(string EssenceName, Vector2 Position)> essences)
+        private bool HasMatchingEssence(dynamic element, List<(Entity entity, LabelOnGround label, string EssenceName, Vector2 Position)> essences)
         {
             var text = element?.Text as string;
             if (string.IsNullOrEmpty(text)) return false;
@@ -499,7 +512,7 @@ namespace EssenceHelper
             }
         }
 
-        private void DrawIndividualPrices(dynamic labelElement, List<(string name, decimal price)> essencesWithPrices)
+        private void DrawIndividualPrices(dynamic labelElement, List<(Entity entity, LabelOnGround label, string EssenceName, Vector2 Position, decimal price)> essencesWithPrices)
         {
             var children = labelElement.Children;
             if (children == null || children.Count == 0) return;
@@ -526,18 +539,18 @@ namespace EssenceHelper
             }
         }
 
-        private void DrawPriceForElement(dynamic element, List<(string name, decimal price)> essencesWithPrices)
+        private void DrawPriceForElement(dynamic element, List<(Entity entity, LabelOnGround label, string EssenceName, Vector2 Position, decimal price)> essencesWithPrices)
         {
             var text = element?.Text as string;
             if (string.IsNullOrEmpty(text)) return;
 
             // optimized search instead of LINQ for better performance
-            (string name, decimal price) matchingEssence = default;
+            (Entity entity, LabelOnGround label, string EssenceName, Vector2 Position, decimal price) matchingEssence = default;
             bool found = false;
             
             for (int i = 0; i < essencesWithPrices.Count; i++)
             {
-                if (essencesWithPrices[i].name.Equals(text, _essenceComparison))
+                if (essencesWithPrices[i].EssenceName.Equals(text, _essenceComparison))
                 {
                     matchingEssence = essencesWithPrices[i];
                     found = true;
@@ -597,6 +610,12 @@ namespace EssenceHelper
                 _isUpdatingEssencePrices = true;
                 
                 var ninjaPricerDataPath = GetNinjaPricerDataPath("Essences");
+                if (string.IsNullOrEmpty(ninjaPricerDataPath))
+                {
+                    LogError("NinjaPricer data path is null or empty");
+                    return;
+                }
+                
                 if (!File.Exists(ninjaPricerDataPath))
                 {
                     LogError($"NinjaPricer data file not found: {ninjaPricerDataPath}");
@@ -604,6 +623,12 @@ namespace EssenceHelper
                 }
 
                 var jsonContent = await File.ReadAllTextAsync(ninjaPricerDataPath);
+                if (string.IsNullOrEmpty(jsonContent))
+                {
+                    LogError("NinjaPricer file content is empty");
+                    return;
+                }
+
                 var ninjaPricerEssences = JsonSerializer.Deserialize<List<NinjaPricerEssenceItem>>(jsonContent, new JsonSerializerOptions
                 {
                     PropertyNameCaseInsensitive = true
@@ -619,12 +644,20 @@ namespace EssenceHelper
                 _essencePriceCache.Clear();
                 foreach (var essence in ninjaPricerEssences)
                 {
-                    if (!string.IsNullOrEmpty(essence.Text))
+                    if (essence != null && !string.IsNullOrEmpty(essence.Text))
                     {
-                        var price = essence.GetCurrentPrice();
-                        if (price > 0)
+                        try
                         {
-                            _essencePriceCache.TryAdd(essence.Text, price);
+                            var price = essence.GetCurrentPrice();
+                            if (price > 0)
+                            {
+                                _essencePriceCache.TryAdd(essence.Text, price);
+                            }
+                        }
+                        catch (Exception essenceEx)
+                        {
+                            LogError($"Error processing essence {essence.Text}: {essenceEx.Message}");
+                            continue;
                         }
                     }
                 }
@@ -644,15 +677,120 @@ namespace EssenceHelper
 
         private string GetNinjaPricerDataPath(string categoryName)
         {
-            // build path: Plugins/Temp/NinjaPricer/poescoutdata/LEAGUE_NAME/CATEGORY_NAME.json
-            var pluginsPath = Path.GetDirectoryName(Path.GetDirectoryName(DirectoryFullName)); // go up from Source/EssenceHelper to Plugins
-            var ninjaPricerTempPath = Path.Combine(pluginsPath, "Temp", "NinjaPricer", "poescoutdata", Settings.LeagueName.Value, $"{categoryName}.json");
-            return ninjaPricerTempPath;
+            try
+            {
+                // build path: Plugins/Temp/NinjaPricer/poescoutdata/LEAGUE_NAME/CATEGORY_NAME.json
+                if (string.IsNullOrEmpty(DirectoryFullName))
+                {
+                    LogError("DirectoryFullName is null or empty");
+                    return null;
+                }
+                
+                if (Settings?.LeagueName?.Value == null)
+                {
+                    LogError("League name is null or empty");
+                    return null;
+                }
+                
+                var pluginsPath = Path.GetDirectoryName(Path.GetDirectoryName(DirectoryFullName)); // go up from Source/EssenceHelper to Plugins
+                if (string.IsNullOrEmpty(pluginsPath))
+                {
+                    LogError("Could not determine plugins path");
+                    return null;
+                }
+                
+                var ninjaPricerTempPath = Path.Combine(pluginsPath, "Temp", "NinjaPricer", "poescoutdata", Settings.LeagueName.Value, $"{categoryName}.json");
+                return ninjaPricerTempPath;
+            }
+            catch (Exception ex)
+            {
+                LogError($"Error building NinjaPricer data path: {ex.Message}");
+                return null;
+            }
         }
 
         private async Task UpdateDeferListFromApi()
         {
             await UpdateEssencePrices();
+        }
+
+        private Element RecursiveFindChildWithTextureName(Element element, string textureName)
+        {
+            if (element.TextureName == textureName) return element;
+            if (element.Children == null) return null;
+            foreach (var child in element.Children)
+            {
+                var result = RecursiveFindChildWithTextureName(child, textureName);
+                if (result != null) return result;
+            }
+            return null;
+        }
+
+        private async void AutoCorruptEssence()
+        {
+            if (!Settings.AutoCorrupt.Value) return;
+
+            var essencesOnGround = _reusableEssencesList;
+            if (essencesOnGround.Count == 0) {
+                return;
+            }
+
+            // group essences by position (same position = same monolith)
+            var essenceGroups = essencesOnGround.GroupBy(e => e.Position).ToList();
+            
+            // find the closest monolith group by parent element
+            var closestGroup = essenceGroups.OrderBy(g => g.First().entity.DistancePlayer).FirstOrDefault();
+            if (closestGroup == null) {
+                return;
+            }
+
+            var firstEssence = closestGroup.First();
+            var distance = firstEssence.entity.DistancePlayer;
+            if (distance > Settings.MinimumDistanceToEssenceToAutoCorrupt.Value) {
+                return;   
+            }
+
+            // calculate total price for all essences in this monolith
+            var totalPrice = closestGroup.Sum(e => GetEssencePrice(e.EssenceName));
+            if (totalPrice > Settings.MaximumPriceToAutoCorrupt.Value) {
+                return;
+            }
+
+            // recursive find child with TextureName = Art/2DItems/Currency/CurrencyVaal.dds
+            var child = RecursiveFindChildWithTextureName(firstEssence.label.Label, "Art/2DItems/Currency/CurrencyVaal.dds");
+
+            if (child == null) {
+                return;
+            }
+
+            var previousMousePosition = Mouse.GetCursorPosition();
+            _lastAutoCorruptTime = DateTime.Now;
+
+            // repeat clicking until no more child with texture is found
+            while (child != null)
+            {
+                await Mouse.MoveMouse(child.GetClientRectCache.Center + GameController.Window.GetWindowRectangleTimeCache.TopLeft);
+                await Task.Delay(10);
+                await Mouse.LeftDown();
+                await Task.Delay(10);
+                await Mouse.LeftUp();
+                await Task.Delay(10);
+                
+                // look for another child with the same texture
+                child = RecursiveFindChildWithTextureName(firstEssence.label.Label, "Art/2DItems/Currency/CurrencyVaal.dds");
+            }
+
+            if (Settings.RestoreMouseToOriginalPosition)
+            {
+                await Mouse.MoveMouse(previousMousePosition);
+            }
+        }
+
+        private bool ShouldAutoCorruptEssence()
+        {
+            if (!Settings.AutoCorrupt.Value) 
+                return false;
+            return DateTime.Now - _lastAutoCorruptTime >= TimeSpan.FromMilliseconds(50);
         }
     }
 }

@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using ExileCore2.Shared.Attributes;
 using ExileCore2.Shared.Interfaces;
 using ExileCore2.Shared.Nodes;
@@ -19,5 +18,17 @@ namespace EssenceHelper
         public ToggleNode UseNinjaPricerData { get; set; } = new(false);
 
         public string LastApiUpdateTime { get; set; } = string.Empty;
+
+        [Menu("Auto corrupt", "Use Vaal Orb on the Essence")]
+        public ToggleNode AutoCorrupt { get; set; } = new(false);
+
+        [Menu("Maximum price in exalts to auto corrupt")]
+        public RangeNode<int> MaximumPriceToAutoCorrupt { get; set; } = new(1, 5, 1000);
+
+        [Menu("Minimum distance to essence to auto corrupt")]
+        public RangeNode<int> MinimumDistanceToEssenceToAutoCorrupt { get; set; } = new(0, 50, 1000);
+
+        [Menu("Restore mouse to original position", "Restore mouse to original position after auto corrupt")]
+        public ToggleNode RestoreMouseToOriginalPosition { get; set; } = new(true);
     }
 }
